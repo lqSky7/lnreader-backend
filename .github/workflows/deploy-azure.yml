@@ -1,37 +1,156 @@
-name: Build and Deploy Container to Azure
+name: Build and Deploy to Azure
 
 on:
   push:
-    branches: [main]
+    branches:
+      - '**'
   workflow_dispatch:
 
-permissions:
-  contents: read
+env:
+  AZURE_CONTAINER_REGISTRY: lnreadersky788.azurecr.io
+  IMAGE_NAME: lnreader-backend
+  RESOURCE_GROUP: lnreader-backend-rg
+  WEBAPP_NAME: lnreader-sync-sky788
+  APP_SERVICE_PLAN: lnreader-plan-india
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Log in to Azure Container Registry (ACR)
-        uses: azure/docker-login@v2
+      - name: Determine deployment target
+        id: target
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "app_name=${{ env.WEBAPP_NAME }}" >> $GITHUB_OUTPUT
+            echo "tag=latest" >> $GITHUB_OUTPUT
+            echo "is_preview=false" >> $GITHUB_OUTPUT
+          else
+            # Sanitize branch name: lowercase, alphanumeric + hyphens, max 40 chars
+            BRANCH_SLUG=$(echo "${{ github.ref_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-40)
+            echo "app_name=${{ env.WEBAPP_NAME }}-preview-${BRANCH_SLUG}" >> $GITHUB_OUTPUT
+            echo "tag=preview-${BRANCH_SLUG}" >> $GITHUB_OUTPUT
+            echo "is_preview=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Login to Azure Container Registry
+        uses: docker/login-action@v3
         with:
-          login-server: lnreadersky788.azurecr.io
-          username: lnreadersky788
+          registry: ${{ env.AZURE_CONTAINER_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
-      - name: Build and Push Docker Image
-        run: |
-          docker build -t lnreadersky788.azurecr.io/lnreader-backend:latest -t lnreadersky788.azurecr.io/lnreader-backend:${{ github.sha }} .
-          docker push lnreadersky788.azurecr.io/lnreader-backend:latest
-          docker push lnreadersky788.azurecr.io/lnreader-backend:${{ github.sha }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Deploy Container to Azure Web App
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.target.outputs.tag }}
+            ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Configure OTLP app settings
+        run: |
+          SETTINGS=()
+          if [ -n "${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}" ]; then
+            SETTINGS+=("OTEL_EXPORTER_OTLP_ENDPOINT=${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}")
+          fi
+          if [ -n "${{ secrets.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT }}" ]; then
+            SETTINGS+=("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${{ secrets.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT }}")
+          fi
+          if [ -n "${{ secrets.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT }}" ]; then
+            SETTINGS+=("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=${{ secrets.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT }}")
+          fi
+          if [ -n "${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}" ]; then
+            SETTINGS+=("OTEL_EXPORTER_OTLP_HEADERS=${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}")
+          fi
+          if [ -n "${{ secrets.OTEL_SDK_DISABLED }}" ]; then
+            SETTINGS+=("OTEL_SDK_DISABLED=${{ secrets.OTEL_SDK_DISABLED }}")
+          fi
+
+          if [ ${#SETTINGS[@]} -gt 0 ]; then
+            az webapp config appsettings set \
+              --name ${{ steps.target.outputs.app_name }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --settings "${SETTINGS[@]}"
+          else
+            echo "No OTLP secrets configured, skipping app settings update."
+          fi
+
+      # For preview branches: create a new Web App on the same App Service Plan
+      - name: Create preview Web App
+        if: steps.target.outputs.is_preview == 'true'
+        run: |
+          # Check if the web app already exists
+          EXISTS=$(az webapp show \
+            --name ${{ steps.target.outputs.app_name }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query name -o tsv 2>/dev/null || echo "")
+
+          if [ -z "$EXISTS" ]; then
+            echo "Creating preview Web App: ${{ steps.target.outputs.app_name }}"
+            az webapp create \
+              --name ${{ steps.target.outputs.app_name }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --plan ${{ env.APP_SERVICE_PLAN }} \
+              --container-image-name ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+            # Copy app settings from production app to preview
+            echo "Copying settings from production..."
+            SETTINGS=$(az webapp config appsettings list \
+              --name ${{ env.WEBAPP_NAME }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              -o json | jq -r '.[] | select(.name != "WEBSITE_HEALTHCHECK_MAXPINGFAILURES") | "\(.name)=\(.value)"')
+
+            if [ -n "$SETTINGS" ]; then
+              echo "$SETTINGS" | while IFS= read -r setting; do
+                az webapp config appsettings set \
+                  --name ${{ steps.target.outputs.app_name }} \
+                  --resource-group ${{ env.RESOURCE_GROUP }} \
+                  --settings "$setting" > /dev/null 2>&1 || true
+              done
+            fi
+
+            # Configure ACR credentials for the preview app
+            az webapp config container set \
+              --name ${{ steps.target.outputs.app_name }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --container-image-name ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+              --container-registry-url https://${{ env.AZURE_CONTAINER_REGISTRY }} \
+              --container-registry-user ${{ secrets.ACR_USERNAME }} \
+              --container-registry-password ${{ secrets.ACR_PASSWORD }}
+          else
+            echo "Preview Web App already exists, updating image..."
+          fi
+
+      - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
-          app-name: lnreader-sync-sky788
-          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
-          images: 'lnreadersky788.azurecr.io/lnreader-backend:${{ github.sha }}'
+          app-name: ${{ steps.target.outputs.app_name }}
+          images: ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Print deployment URL
+        run: |
+          if [ "${{ steps.target.outputs.is_preview }}" = "true" ]; then
+            echo "Preview: https://${{ steps.target.outputs.app_name }}.azurewebsites.net"
+          else
+            echo "Production: https://${{ env.WEBAPP_NAME }}.azurewebsites.net"
+          fi
+
+      - name: Logout from Azure
+        run: az logout
+        if: always()
