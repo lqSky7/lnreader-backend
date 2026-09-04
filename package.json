@@ -5,14 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsc --noEmit",
+    "build": "tsc --noEmit && tsc --noEmit -p tsconfig.tests.json",
     "start": "node --import tsx src/server.ts",
+    "test": "NODE_ENV=test node --import tsx --test --test-concurrency=1 tests/*.test.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy"
   },
   "dependencies": {
-    "@better-auth/prisma-adapter": "^1.6.0",
     "@prisma/client": "^6.16.0",
     "better-auth": "^1.6.0",
     "cors": "^2.8.5",

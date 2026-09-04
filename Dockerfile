@@ -20,5 +20,6 @@ RUN npx prisma generate
 EXPOSE 8080
 ENV PORT=8080
 
-# Start server
-CMD ["npm", "start"]
+# Apply pending migrations at container startup so fresh environments
+# (and new deploys) never boot against an empty database, then start server.
+CMD ["sh", "-c", "npx prisma migrate deploy && npm start"]
